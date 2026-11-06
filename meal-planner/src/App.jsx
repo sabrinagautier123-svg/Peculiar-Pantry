@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { 
   Calendar, Plus, Trash2, CheckCircle, Circle, ChefHat, 
   ShoppingBag, Clock, Users, X, BookOpen, HelpCircle, Utensils, Pencil, Eye, Upload
@@ -92,16 +92,83 @@ const INITIAL_PLAN = {
   Sunday: { Breakfast: [{ id: '1', portions: 1 }], Lunch: [{ id: '2', portions: 1 }], Snack: [{ id: '3', portions: 1 }], Dinner: [{ id: '2', portions: 1 }] }
 };
 
+// ---------- Shared recipe sync (Netlify Function + Netlify Blobs) ----------
+const API = '/.netlify/functions/recipes';
+
+const readLS = (key, fallback) => {
+  try {
+    const v = localStorage.getItem(key);
+    return v ? JSON.parse(v) : fallback;
+  } catch {
+    return fallback;
+  }
+};
+
+// Each recipe you create gets a secret token stored only in this browser.
+// It proves ownership, so only you can edit or delete your shared recipes.
+const getTokens = () => readLS('ppp_tokens', {});
+const saveToken = (id, token) =>
+  localStorage.setItem('ppp_tokens', JSON.stringify({ ...getTokens(), [id]: token }));
+const newToken = () =>
+  (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
+
+const apiFetch = async (method, body, token, query = '') => {
+  const res = await fetch(API + query, {
+    method,
+    headers: { 'Content-Type': 'application/json', ...(token ? { 'x-owner-token': token } : {}) },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Request failed');
+  return res.json();
+};
+
+// Shrink uploaded photos so shared recipes stay small and fast to load.
+const resizeImage = (file, maxSize, quality = 0.8) =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = reject;
+    reader.onload = () => {
+      const image = new Image();
+      image.onerror = reject;
+      image.onload = () => {
+        const scale = Math.min(1, maxSize / Math.max(image.width, image.height));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(image.width * scale);
+        canvas.height = Math.round(image.height * scale);
+        canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      image.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+
 const daysOfWeek = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
 const mealTypes = ['Breakfast', 'Lunch', 'Snack', 'Dinner'];
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('planner');
 
-  const [recipes, setRecipes] = useState(() => {
-    const saved = localStorage.getItem('ppp_recipes');
-    return saved ? JSON.parse(saved) : INITIAL_RECIPES;
-  });
+  // Shared recipes come from the server; built-in starters stay local.
+  const [sharedRecipes, setSharedRecipes] = useState(() => readLS('ppp_shared_cache', []));
+  const [hiddenIds, setHiddenIds] = useState(() => readLS('ppp_hidden', []));
+
+  const recipes = useMemo(() => {
+    const sharedIds = new Set(sharedRecipes.map((r) => r.id));
+    const starters = INITIAL_RECIPES.filter((r) => !sharedIds.has(r.id));
+    return [...sharedRecipes, ...starters].filter((r) => !hiddenIds.includes(r.id));
+  }, [sharedRecipes, hiddenIds]);
+
+  const isOwner = (id) => Boolean(getTokens()[id]);
+
+  const refreshShared = useCallback(async () => {
+    try {
+      const { recipes: list } = await apiFetch('GET');
+      setSharedRecipes(list);
+    } catch (err) {
+      console.warn('Could not load shared recipes:', err.message);
+    }
+  }, []);
 
   const [weeklyPlan, setWeeklyPlan] = useState(() => {
     const saved = localStorage.getItem('ppp_plan');
@@ -138,8 +205,46 @@ export default function App() {
 
   // Sync state changes to local storage
   useEffect(() => {
-    localStorage.setItem('ppp_recipes', JSON.stringify(recipes));
-  }, [recipes]);
+    try {
+      localStorage.setItem('ppp_shared_cache', JSON.stringify(sharedRecipes));
+    } catch {
+      /* cache is optional (e.g. storage full) */
+    }
+  }, [sharedRecipes]);
+
+  useEffect(() => {
+    localStorage.setItem('ppp_hidden', JSON.stringify(hiddenIds));
+  }, [hiddenIds]);
+
+  // Load on start, and again whenever the tab regains focus
+  useEffect(() => {
+    (async () => {
+      // One-time migration: publish custom recipes this browser saved before sharing existed
+      if (!localStorage.getItem('ppp_migrated')) {
+        const legacy = readLS('ppp_recipes', []).filter(
+          (r) => !INITIAL_RECIPES.some((s) => s.id === r.id)
+        );
+        try {
+          for (const r of legacy) {
+            const token = newToken();
+            try {
+              await apiFetch('POST', r, token);
+              saveToken(r.id, token);
+            } catch {
+              /* skip duplicates or invalid recipes */
+            }
+          }
+          localStorage.setItem('ppp_migrated', '1');
+        } catch {
+          /* try again next visit */
+        }
+      }
+      refreshShared();
+    })();
+    const onFocus = () => document.visibilityState === 'visible' && refreshShared();
+    document.addEventListener('visibilitychange', onFocus);
+    return () => document.removeEventListener('visibilitychange', onFocus);
+  }, [refreshShared]);
 
   useEffect(() => {
     localStorage.setItem('ppp_plan', JSON.stringify(weeklyPlan));
@@ -261,29 +366,42 @@ export default function App() {
     setIsRecipeModalOpen(true);
   };
 
-  const handleDeleteRecipe = (id) => {
-    setRecipes((prev) => prev.filter((r) => r.id !== id));
-    showNotification('Recipe deleted from cookbook');
+  const handleDeleteRecipe = async (id) => {
+    const token = getTokens()[id];
+    if (!token) {
+      // Not yours (or a starter recipe): hide it on this device only
+      setHiddenIds((prev) => [...prev, id]);
+      showNotification('Recipe hidden on this device');
+      return;
+    }
+    if (!window.confirm('Delete this recipe for everyone?')) return;
+    try {
+      await apiFetch('DELETE', null, token, `?id=${encodeURIComponent(id)}`);
+      setSharedRecipes((prev) => prev.filter((r) => r.id !== id));
+      showNotification('Recipe deleted from shared cookbook');
+    } catch (err) {
+      showNotification(`Could not delete: ${err.message}`);
+    }
   };
 
-  const handleImageFileUpload = (e, targetField, index = null) => {
+  const handleImageFileUpload = async (e, targetField, index = null) => {
     const file = e.target.files[0];
     if (!file) return;
 
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      const dataUrl = reader.result;
+    try {
+      const dataUrl = await resizeImage(file, targetField === 'cover' ? 800 : 300);
       if (targetField === 'cover') {
-        setNewRecipe(prev => ({ ...prev, image: dataUrl }));
+        setNewRecipe((prev) => ({ ...prev, image: dataUrl }));
       } else if (targetField === 'ingredient' && index !== null) {
-        setNewRecipe(prev => {
+        setNewRecipe((prev) => {
           const updatedIngs = [...prev.ingredients];
-          updatedIngs[index].image = dataUrl;
+          updatedIngs[index] = { ...updatedIngs[index], image: dataUrl };
           return { ...prev, ingredients: updatedIngs };
         });
       }
-    };
-    reader.readAsDataURL(file);
+    } catch {
+      showNotification('Could not read that image');
+    }
   };
 
   const handleAddIngredientRow = () => {
@@ -327,14 +445,14 @@ export default function App() {
     }));
   };
 
-  const handleSaveCustomRecipe = (e) => {
+  const handleSaveCustomRecipe = async (e) => {
     e.preventDefault();
     if (!newRecipe.title.trim()) return;
 
     const macros = estimateNutritionFromIngredients(newRecipe.ingredients);
     const tags = estimateTagsFromRecipe(newRecipe);
 
-    const recipeId = editingRecipeId || Date.now().toString();
+    const recipeId = editingRecipeId || `r${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
     const recipeData = {
       id: recipeId,
       ...newRecipe,
@@ -348,18 +466,36 @@ export default function App() {
         'https://images.unsplash.com/photo-1498837167922-ddd27525d352?w=600&auto=format&fit=crop&q=80'
     };
 
-    if (editingRecipeId) {
-      setRecipes((prev) =>
-        prev.map((r) => (r.id === editingRecipeId ? recipeData : r))
-      );
-      showNotification(`Updated "${recipeData.title}"!`);
-    } else {
-      setRecipes((prev) => [recipeData, ...prev]);
-      showNotification(`Added "${recipeData.title}" to Cookbook!`);
-    }
+    const closeModal = () => {
+      setIsRecipeModalOpen(false);
+      setEditingRecipeId(null);
+    };
 
-    setIsRecipeModalOpen(false);
-    setEditingRecipeId(null);
+    if (editingRecipeId) {
+      const token = getTokens()[editingRecipeId];
+      const previous = sharedRecipes;
+      setSharedRecipes((prev) => prev.map((r) => (r.id === editingRecipeId ? recipeData : r)));
+      closeModal();
+      try {
+        await apiFetch('PUT', recipeData, token);
+        showNotification(`Updated "${recipeData.title}"!`);
+      } catch (err) {
+        setSharedRecipes(previous);
+        showNotification(`Could not update: ${err.message}`);
+      }
+    } else {
+      const token = newToken();
+      setSharedRecipes((prev) => [recipeData, ...prev]);
+      closeModal();
+      try {
+        await apiFetch('POST', recipeData, token);
+        saveToken(recipeData.id, token);
+        showNotification(`Shared "${recipeData.title}" with everyone!`);
+      } catch (err) {
+        setSharedRecipes((prev) => prev.filter((r) => r.id !== recipeData.id));
+        showNotification(`Could not save: ${err.message}`);
+      }
+    }
   };
 
   const handleMealSlotChange = (day, meal, index, field, value) => {
@@ -762,7 +898,7 @@ export default function App() {
             <div className="flex flex-col md:flex-row items-center justify-between gap-4">
               <div>
                 <h2 className="text-2xl font-black text-slate-900">Cookbook</h2>
-                <p className="text-xs text-slate-500">Saved custom recipes</p>
+                <p className="text-xs text-slate-500">Recipes shared by everyone</p>
               </div>
 
               <div className="flex items-center gap-3 w-full md:w-auto">
@@ -788,16 +924,18 @@ export default function App() {
                   <div className="relative h-48 bg-slate-100 cursor-pointer" onClick={() => setLightboxImage(recipe.image)}>
                     <img src={recipe.image} alt={recipe.title} className="w-full h-full object-cover" />
                     <div className="absolute top-3 right-3 flex items-center gap-1.5">
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleOpenEditRecipe(recipe);
-                        }}
-                        className="p-2 bg-white/90 hover:bg-emerald-600 hover:text-white text-slate-700 rounded-full transition shadow-md"
-                        title="Edit Recipe"
-                      >
-                        <Pencil className="w-4 h-4" />
-                      </button>
+                      {isOwner(recipe.id) && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleOpenEditRecipe(recipe);
+                          }}
+                          className="p-2 bg-white/90 hover:bg-emerald-600 hover:text-white text-slate-700 rounded-full transition shadow-md"
+                          title="Edit Recipe"
+                        >
+                          <Pencil className="w-4 h-4" />
+                        </button>
+                      )}
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
